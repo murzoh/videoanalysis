@@ -1,50 +1,49 @@
 #!/usr/bin/env python3
-# --- Hard guard: enforce known-good Torch/TorchVision pair and avoid torchvision inside transformers ---
-import os, sys
+# --- Permanent fix: enforce known-good Torch/TorchVision and auto-heal if needed ---
+import os, sys, subprocess
 
-# 1) Transformers without torchvision (prevents torchvision::nms import path)
+# 1) Keep Transformers from importing torchvision internals (avoids nms path)
 os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
 
-# 2) Enforce exact versions to avoid silent mismatches
+# 2) Required versions (known good)
 REQUIRED_TORCH = "2.5.1"
 REQUIRED_VISION = "0.20.1"
 
-def _die(msg: str) -> None:
-    print(f"[startup] {msg}", file=sys.stderr)
-    print(
-        "[startup] Fix with:\n"
-        "  python3 -m pip uninstall -y torch torchvision torchaudio && \n"
-        "  python3 -m pip install --break-system-packages --timeout 300 --retries 5 \\\n"
-        "    --index-url https://download.pytorch.org/whl/cu121 \\\n"
-        f"    'torch=={REQUIRED_TORCH}' 'torchvision=={REQUIRED_VISION}'\n",
-        file=sys.stderr,
-    )
-    sys.exit(1)
+# 3) Where to get wheels (default cu121); override via env if you really want another tag
+WHEEL_INDEX = os.environ.get("SMOL_TORCH_INDEX", "https://download.pytorch.org/whl/cu121")
+# PIP reliability flags
+PIP_FLAGS = os.environ.get("SMOL_PIP_FLAGS", "--break-system-packages --timeout 300 --retries 5")
 
-try:
-    import torch
-except Exception as e:
-    _die(f"Could not import torch: {e}")
+def _ensure_known_good_pair():
+    """Import torch/vision; if wrong pair, auto-fix via pip and re-exec once."""
+    try:
+        import torch
+        try:
+            import torchvision  # optional; we won't use it but we validate version if present
+            vision_ver = getattr(torchvision, "__version__", "")
+        except Exception as e:
+            # If torchvision missing/broken we still enforce installing the pair
+            vision_ver = None
+            raise RuntimeError(f"torchvision issue: {e}")
+        if torch.__version__ == REQUIRED_TORCH and vision_ver == REQUIRED_VISION:
+            return  # all good
+        raise RuntimeError(f"bad pair torch={getattr(torch,'__version__',None)} torchvision={vision_ver}")
+    except Exception as e:
+        if os.environ.get("SMOL_AUTOFIX_DONE") == "1":
+            print(f"[startup] Torch pair still wrong after autofix: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"[startup] Fixing Torch pair due to: {e}", file=sys.stderr)
+        # Uninstall then install the exact pair from the chosen index
+        subprocess.call([sys.executable, "-m", "pip", "uninstall", "-y", "torch", "torchvision", "torchaudio"])
+        cmd = [sys.executable, "-m", "pip", "install", *PIP_FLAGS.split(),
+               "--index-url", WHEEL_INDEX, f"torch=={REQUIRED_TORCH}", f"torchvision=={REQUIRED_VISION}"]
+        subprocess.check_call(cmd)
+        # Avoid loops; restart the process so ALL imports see the fixed env
+        os.environ["SMOL_AUTOFIX_DONE"] = "1"
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
-# Torch present; check version
-if getattr(torch, "__version__", "") != REQUIRED_TORCH:
-    _die(f"torch version {torch.__version__!r} != required {REQUIRED_TORCH!r}")
+_ensure_known_good_pair()
 
-# TorchVision is optional for runtime (we set TRANSFORMERS_NO_TORCHVISION=1), but if present, must match.
-try:
-    import torchvision
-    vision_ver = getattr(torchvision, "__version__", "")
-    if vision_ver != REQUIRED_VISION:
-        _die(f"torchvision version {vision_ver!r} != required {REQUIRED_VISION!r}")
-except Exception as e:
-    # If import fails entirely, we can allow run to continue because transformers won't use it.
-    # Uncomment next line to make torchvision strictly required:
-    # _die(f"Could not import torchvision: {e}")
-    print(f"[startup] torchvision not loaded (ok) or errored: {e}", file=sys.stderr)
-
-# Optional: warn if CUDA expected but missing
-if not torch.cuda.is_available():
-    print("[startup] WARNING: CUDA not available; running on CPU.", file=sys.stderr)
 
 # --- Normal imports continue below ---
 import io, base64
