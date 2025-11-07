@@ -1,11 +1,59 @@
 #!/usr/bin/env python3
-import os, io, base64
+# --- Hard guard: enforce known-good Torch/TorchVision pair and avoid torchvision inside transformers ---
+import os, sys
+
+# 1) Transformers without torchvision (prevents torchvision::nms import path)
+os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
+
+# 2) Enforce exact versions to avoid silent mismatches
+REQUIRED_TORCH = "2.5.1"
+REQUIRED_VISION = "0.20.1"
+
+def _die(msg: str) -> None:
+    print(f"[startup] {msg}", file=sys.stderr)
+    print(
+        "[startup] Fix with:\n"
+        "  python3 -m pip uninstall -y torch torchvision torchaudio && \n"
+        "  python3 -m pip install --break-system-packages --timeout 300 --retries 5 \\\n"
+        "    --index-url https://download.pytorch.org/whl/cu121 \\\n"
+        f"    'torch=={REQUIRED_TORCH}' 'torchvision=={REQUIRED_VISION}'\n",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+try:
+    import torch
+except Exception as e:
+    _die(f"Could not import torch: {e}")
+
+# Torch present; check version
+if getattr(torch, "__version__", "") != REQUIRED_TORCH:
+    _die(f"torch version {torch.__version__!r} != required {REQUIRED_TORCH!r}")
+
+# TorchVision is optional for runtime (we set TRANSFORMERS_NO_TORCHVISION=1), but if present, must match.
+try:
+    import torchvision
+    vision_ver = getattr(torchvision, "__version__", "")
+    if vision_ver != REQUIRED_VISION:
+        _die(f"torchvision version {vision_ver!r} != required {REQUIRED_VISION!r}")
+except Exception as e:
+    # If import fails entirely, we can allow run to continue because transformers won't use it.
+    # Uncomment next line to make torchvision strictly required:
+    # _die(f"Could not import torchvision: {e}")
+    print(f"[startup] torchvision not loaded (ok) or errored: {e}", file=sys.stderr)
+
+# Optional: warn if CUDA expected but missing
+if not torch.cuda.is_available():
+    print("[startup] WARNING: CUDA not available; running on CPU.", file=sys.stderr)
+
+# --- Normal imports continue below ---
+import io, base64
 from typing import List, Optional, Literal
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from PIL import Image
-import torch
 from transformers import AutoProcessor, AutoModelForImageTextToText
+
 
 MODEL_ID = os.environ.get("SMOLVLM2_MODEL", "HuggingFaceTB/SmolVLM2-500M-Video-Instruct")
 DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
