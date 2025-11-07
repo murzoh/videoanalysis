@@ -3,6 +3,11 @@ set -euxo pipefail
 # All output goes here:
 exec >/root/boot.log 2>&1
 
+# ---- PIP network robustness (tweak if needed) ----
+export PIP_DEFAULT_TIMEOUT=300   # seconds
+PIP_TIMEOUT=300
+PIP_RETRIES=5
+
 echo "[boot] begin $(date)"
 
 # --- Base system deps ---
@@ -47,9 +52,10 @@ elif [ "$TAG" = "cu118" ]; then
 fi
 echo "[boot] first index: $FIRST_INDEX  pair: $FIRST_TORCH / $FIRST_VISION"
 
-# 3) Clean + install the first attempt
+# 3) Clean + install the first attempt (with timeout/retries)
 python3 -m pip uninstall -y torch torchvision torchaudio || true
-python3 -m pip install --break-system-packages --index-url "$FIRST_INDEX" "$FIRST_TORCH" "$FIRST_VISION"
+python3 -m pip install --break-system-packages --timeout "$PIP_TIMEOUT" --retries "$PIP_RETRIES" \
+  --index-url "$FIRST_INDEX" "$FIRST_TORCH" "$FIRST_VISION"
 
 # 4) Import test; if it fails, force the cu121 pair
 FALLBACK=0
@@ -63,8 +69,8 @@ PY
 if [ "$FALLBACK" = "1" ]; then
   echo "[boot] import failed; falling back to cu121 pair"
   python3 -m pip uninstall -y torch torchvision torchaudio || true
-  python3 -m pip install --break-system-packages --index-url https://download.pytorch.org/whl/cu121 \
-    "torch==2.5.1" "torchvision==0.20.1"
+  python3 -m pip install --break-system-packages --timeout "$PIP_TIMEOUT" --retries "$PIP_RETRIES" \
+    --index-url https://download.pytorch.org/whl/cu121 "torch==2.5.1" "torchvision==0.20.1"
   python3 - <<'PY'
 import torch, torchvision
 print("Fallback OK ->", torch.__version__, "/", torchvision.__version__)
@@ -75,7 +81,7 @@ fi
 # export TRANSFORMERS_NO_TORCHVISION=1
 
 # ---------------- Other Python deps ----------------
-python3 -m pip install --break-system-packages \
+python3 -m pip install --break-system-packages --timeout "$PIP_TIMEOUT" --retries "$PIP_RETRIES" \
   fastapi "uvicorn[standard]" pillow transformers accelerate requests opencv-python num2words \
   --upgrade --ignore-installed blinker itsdangerous
 
