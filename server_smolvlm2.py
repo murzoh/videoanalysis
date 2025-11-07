@@ -1,63 +1,63 @@
 #!/usr/bin/env python3
 # --- Permanent fix: enforce known-good Torch/TorchVision and auto-heal if needed ---
-import os, sys, subprocess
+import os, sys, subprocess, re
 
-# 1) Keep Transformers from importing torchvision internals (avoids nms path)
+# Keep Transformers from importing torchvision internals (avoids nms path)
 os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
 
-# 2) Required versions (known good)
-REQUIRED_TORCH = "2.5.1"
-REQUIRED_VISION = "0.20.1"
-
-# 3) Where to get wheels (default cu121); override via env if you really want another tag
+REQUIRED_TORCH_BASE = "2.5.1"
+REQUIRED_VISION_BASE = "0.20.1"
 WHEEL_INDEX = os.environ.get("SMOL_TORCH_INDEX", "https://download.pytorch.org/whl/cu121")
-# PIP reliability flags
 PIP_FLAGS = os.environ.get("SMOL_PIP_FLAGS", "--break-system-packages --timeout 300 --retries 5")
 
+def _base_ver(v: str) -> str:
+    v = v.split("+", 1)[0]
+    v = re.split(r"[- ]", v, 1)[0]
+    return v
+
 def _ensure_known_good_pair():
-    """Import torch/vision; if wrong pair, auto-fix via pip and re-exec once."""
     try:
         import torch
+        torch_base = _base_ver(getattr(torch, "__version__", ""))
         try:
-            import torchvision  # optional; we won't use it but we validate version if present
-            vision_ver = getattr(torchvision, "__version__", "")
+            import torchvision
+            vision_base = _base_ver(getattr(torchvision, "__version__", ""))
         except Exception as e:
-            # If torchvision missing/broken we still enforce installing the pair
-            vision_ver = None
+            vision_base = None
             raise RuntimeError(f"torchvision issue: {e}")
-        if torch.__version__ == REQUIRED_TORCH and vision_ver == REQUIRED_VISION:
-            return  # all good
-        raise RuntimeError(f"bad pair torch={getattr(torch,'__version__',None)} torchvision={vision_ver}")
+        if torch_base == REQUIRED_TORCH_BASE and vision_base == REQUIRED_VISION_BASE:
+            return
+        raise RuntimeError(f"bad pair torch={torch_base!r} torchvision={vision_base!r}")
     except Exception as e:
         if os.environ.get("SMOL_AUTOFIX_DONE") == "1":
             print(f"[startup] Torch pair still wrong after autofix: {e}", file=sys.stderr)
             sys.exit(1)
         print(f"[startup] Fixing Torch pair due to: {e}", file=sys.stderr)
-        # Uninstall then install the exact pair from the chosen index
         subprocess.call([sys.executable, "-m", "pip", "uninstall", "-y", "torch", "torchvision", "torchaudio"])
         cmd = [sys.executable, "-m", "pip", "install", *PIP_FLAGS.split(),
-               "--index-url", WHEEL_INDEX, f"torch=={REQUIRED_TORCH}", f"torchvision=={REQUIRED_VISION}"]
+               "--index-url", WHEEL_INDEX,
+               f"torch=={REQUIRED_TORCH_BASE}", f"torchvision=={REQUIRED_VISION_BASE}"]
         subprocess.check_call(cmd)
-        # Avoid loops; restart the process so ALL imports see the fixed env
         os.environ["SMOL_AUTOFIX_DONE"] = "1"
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
 _ensure_known_good_pair()
 
-
-# --- Normal imports continue below ---
+# ---- Safe to import torch-dependent libs now ----
 import io, base64
 from typing import List, Optional, Literal
+import torch
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from PIL import Image
 from transformers import AutoProcessor, AutoModelForImageTextToText
 
-
+# ---------------- Model / device ----------------
 MODEL_ID = os.environ.get("SMOLVLM2_MODEL", "HuggingFaceTB/SmolVLM2-500M-Video-Instruct")
 DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE    = torch.float16 if DEVICE == "cuda" else torch.float32
-API_KEY  = os.environ.get("SMOLVLM_API_KEY")  # optional
+API_KEY  = os.environ.get("SMOLVLM_API_KEY")
+
 
 print(f"Loading {MODEL_ID} on {DEVICE}…")
 processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
