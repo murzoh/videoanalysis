@@ -49,7 +49,7 @@ echo "[boot] SMOLVLM2_MODEL=${SMOLVLM2_MODEL:-unset}"
 
 # --- Fetch server script from the repo (RAW URL) ---
 cd /root
-curl -fsSL https://raw.githubusercontent.com/murzoh/videoanalysis/<branch>/server_smolvlm2.py -o server_smolvlm2.py
+curl -fsSL https://raw.githubusercontent.com/murzoh/videoanalysis/main/server_smolvlm2.py -o server_smolvlm2.py
 chmod +x server_smolvlm2.py
 
 # Guard against CRLF if edited on Windows
