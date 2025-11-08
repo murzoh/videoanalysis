@@ -277,36 +277,44 @@ def _run_generate(inputs, max_new_tokens: int):
         )
 
 @app.post("/analyze")
+@app.post("/analyze")
 def analyze(req: AnalyzeRequest, x_api_key: Optional[str] = Header(default=None)):
+    global DEVICE, DTYPE, model  # <-- moved here (top of function)
+
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
     try:
-        pil_images=[Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB") for b64 in req.images_b64]
-        user_text=build_user_text(req)
-        inputs=_prepare_inputs(pil_images, user_text)
-        out_ids=_run_generate(inputs, req.max_new_tokens)
-        text=processor.batch_decode(out_ids, skip_special_tokens=True)[0].strip()
+        pil_images = [Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+                      for b64 in req.images_b64]
+        user_text = build_user_text(req)
+        inputs = _prepare_inputs(pil_images, user_text)
+        out_ids = _run_generate(inputs, req.max_new_tokens)
+        text = processor.batch_decode(out_ids, skip_special_tokens=True)[0].strip()
         return {"text": text}
+
     except RuntimeError as e:
         msg = str(e).lower()
         if ("no kernel image" in msg or "illegal instruction" in msg) and DEVICE == "cuda":
             # Runtime failover
-            print("[runtime] CUDA kernel-image error → switching to CPU FP32 and retrying once…", file=sys.stderr)
-            global DEVICE, DTYPE, model
+            print("[runtime] CUDA kernel-image error → switching to CPU FP32 and retrying once…",
+                  file=sys.stderr)
             DEVICE, DTYPE = "cpu", torch.float32
             model = load_model(DEVICE, DTYPE)
             try:
-                pil_images=[Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB") for b64 in req.images_b64]
-                user_text=build_user_text(req)
-                inputs=_prepare_inputs(pil_images, user_text)
-                out_ids=_run_generate(inputs, req.max_new_tokens)
-                text=processor.batch_decode(out_ids, skip_special_tokens=True)[0].strip()
+                pil_images = [Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+                              for b64 in req.images_b64]
+                user_text = build_user_text(req)
+                inputs = _prepare_inputs(pil_images, user_text)
+                out_ids = _run_generate(inputs, req.max_new_tokens)
+                text = processor.batch_decode(out_ids, skip_special_tokens=True)[0].strip()
                 return {"text": text, "fallback": "cpu_fp32"}
             except Exception as e2:
-                raise HTTPException(status_code=500, detail=f"Server error after CPU fallback: {type(e2).__name__}: {e2}")
+                raise HTTPException(status_code=500,
+                                    detail=f"Server error after CPU fallback: {type(e2).__name__}: {e2}")
         raise HTTPException(status_code=500, detail=f"Server error: {type(e).__name__}: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Server error: {type(e).__name__}: {e}")
+
 
 if __name__ == "__main__":
     import uvicorn
