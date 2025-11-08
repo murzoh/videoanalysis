@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+SmolVLM2 Remote Server (drop-in)
+- Auto-heals Torch/TorchVision pair to a known-good combo.
+- Prints GPU name + SM capability.
+- Picks a safe dtype automatically (FP32 on older GPUs).
+- Retries on kernel-image errors: CUDA fp16 -> CUDA fp32 -> CPU fp32.
+- Avoids torchvision internals with TRANSFORMERS_NO_TORCHVISION=1.
+"""
+
 # --- Permanent fix: enforce known-good Torch/TorchVision and auto-heal if needed ---
 import os, sys, subprocess, re
 
@@ -17,11 +28,11 @@ def _base_ver(v: str) -> str:
 
 def _ensure_known_good_pair():
     try:
-        import torch
+        import torch  # noqa
         torch_base = _base_ver(getattr(torch, "__version__", ""))
         try:
-            import torchvision
-            vision_base = _base_ver(getattr(torchvision, "__version__", ""))
+            import torchvision  # noqa
+            vision_base = _base_ver(getattr(__import__("torchvision"), "__version__", ""))
         except Exception as e:
             vision_base = None
             raise RuntimeError(f"torchvision issue: {e}")
@@ -54,20 +65,55 @@ from transformers import AutoProcessor, AutoModelForImageTextToText
 
 # ---------------- Model / device ----------------
 MODEL_ID = os.environ.get("SMOLVLM2_MODEL", "HuggingFaceTB/SmolVLM2-500M-Video-Instruct")
-DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE    = torch.float16 if DEVICE == "cuda" else torch.float32
 API_KEY  = os.environ.get("SMOLVLM_API_KEY")
 
+def pick_device_and_dtype():
+    """Choose the safest usable device/dtype for this GPU."""
+    if not torch.cuda.is_available():
+        print("[startup] CUDA not available → using CPU.")
+        return "cpu", torch.float32
+    name = torch.cuda.get_device_name(0)
+    cap_major, cap_minor = torch.cuda.get_device_capability(0)
+    print(f"[startup] CUDA device: {name} (SM {cap_major}.{cap_minor})")
+    # Older GPUs (e.g., SM 5.x) often lack modern FP16 kernels → prefer FP32.
+    if cap_major < 6:
+        print("[startup] Older SM detected → using float32 on CUDA.")
+        return "cuda", torch.float32
+    # Otherwise FP16 is typically fine and faster.
+    return "cuda", torch.float16
 
-print(f"Loading {MODEL_ID} on {DEVICE}…")
+DEVICE, DTYPE = pick_device_and_dtype()
+
+print(f"Loading {MODEL_ID} on {DEVICE} with dtype={DTYPE}…")
 processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
-model = AutoModelForImageTextToText.from_pretrained(
-    MODEL_ID, torch_dtype=DTYPE, low_cpu_mem_usage=True, trust_remote_code=True
-).to(DEVICE)
-model.eval()
+
+def load_model(device: str, dtype: torch.dtype):
+    m = AutoModelForImageTextToText.from_pretrained(
+        MODEL_ID, torch_dtype=dtype, low_cpu_mem_usage=True, trust_remote_code=True
+    )
+    return m.to(device).eval()
+
+try:
+    model = load_model(DEVICE, DTYPE)
+except RuntimeError as e:
+    msg = str(e).lower()
+    if "no kernel image" in msg or "no kernel image is available" in msg:
+        if DEVICE == "cuda" and DTYPE != torch.float32:
+            print("[startup] Retry: switching to float32 on CUDA due to kernel image error…")
+            DEVICE, DTYPE = "cuda", torch.float32
+            model = load_model(DEVICE, DTYPE)
+        else:
+            print("[startup] Retry: falling back to CPU due to kernel image error…")
+            DEVICE, DTYPE = "cpu", torch.float32
+            model = load_model(DEVICE, DTYPE)
+    else:
+        raise
+
+# Threading cap (keeps small VMs snappy)
 torch.set_num_threads(max(1, min(8, os.cpu_count() or 4)))
 print("Model ready.")
 
+# ---------------- Inference prompt scaffolding ----------------
 EVENT_ENUM = ["goal","shot_on_target","shot_off_target","save","foul","offside","corner","none"]
 
 SERVER_SYSTEM_PROMPT = f"""
@@ -95,6 +141,7 @@ STRICT RULES
 - 'goal' only if the ball clearly crosses the line; 'save' when keeper stops a goal-bound shot.
 """.strip()
 
+# ---------------- FastAPI app ----------------
 app = FastAPI(title="SmolVLM2 Remote Server")
 
 class AnalyzeRequest(BaseModel):
@@ -118,15 +165,18 @@ def build_user_text(req: AnalyzeRequest) -> str:
         parts.append(f"Teams: home={req.home_team or 'home'}, away={req.away_team or 'away'}.")
     if req.home_kit or req.away_kit:
         parts.append(f"Kits: home={req.home_kit or 'unknown'}, away={req.away_kit or 'unknown'}.")
-    if req.period: parts.append(f"Period: {req.period}.")
-    if req.attack_direction_home: parts.append(f"Home attacks: {req.attack_direction_home.replace('_','->')}.")
+    if req.period:
+        parts.append(f"Period: {req.period}.")
+    if req.attack_direction_home:
+        parts.append(f"Home attacks: {req.attack_direction_home.replace('_','->')}.")
     parts.append("Decide using all frames jointly. Prefer 'save' over 'goal' if keeper contact is visible; use 'none' if cues are weak or conflicting.")
-    if req.prompt: parts.append(req.prompt.strip())
+    if req.prompt:
+        parts.append(req.prompt.strip())
     return "\n".join(parts)
 
 @app.get("/health")
 def health():
-    return {"ok": True, "model": MODEL_ID, "device": DEVICE}
+    return {"ok": True, "model": MODEL_ID, "device": DEVICE, "dtype": str(DTYPE)}
 
 @app.post("/analyze")
 def analyze(req: AnalyzeRequest, x_api_key: Optional[str] = Header(default=None)):
@@ -135,19 +185,29 @@ def analyze(req: AnalyzeRequest, x_api_key: Optional[str] = Header(default=None)
     try:
         pil_images=[Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB") for b64 in req.images_b64]
         user_text=build_user_text(req)
-        messages=[{"role":"system","content":SERVER_SYSTEM_PROMPT},
-                  {"role":"user","content":([{"type":"image","pil":im} for im in pil_images]+[{"type":"text","text":user_text}])}]
+        messages=[
+            {"role":"system","content":SERVER_SYSTEM_PROMPT},
+            {"role":"user","content":([{"type":"image","pil":im} for im in pil_images] + [{"type":"text","text":user_text}])}
+        ]
         prompt_text=processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-        inputs=processor(text=prompt_text, images=pil_images, return_tensors="pt", truncation=True).to(DEVICE)
-        if "pixel_values" in inputs and inputs["pixel_values"].dtype!=model.dtype:
-            inputs["pixel_values"]=inputs["pixel_values"].to(dtype=model.dtype)
+        inputs=processor(text=prompt_text, images=pil_images, return_tensors="pt", truncation=True)
+        # Move to the selected device
+        inputs = {k: (v.to(DEVICE) if hasattr(v, "to") else v) for k, v in inputs.items()}
+        # Align image tensor dtype with model dtype (avoids FP16/FP32 mismatch)
+        if "pixel_values" in inputs and hasattr(inputs["pixel_values"], "dtype") and inputs["pixel_values"].dtype != next(model.parameters()).dtype:
+            inputs["pixel_values"] = inputs["pixel_values"].to(dtype=next(model.parameters()).dtype)
         with torch.no_grad():
-            out_ids=model.generate(**inputs, do_sample=False, max_new_tokens=max(64, min(256, req.max_new_tokens)))
-        text=processor.batch_decode(out_ids, skip_special_tokens=True)[0].strip()
+            out_ids = model.generate(
+                **inputs,
+                do_sample=False,
+                max_new_tokens=max(64, min(256, req.max_new_tokens))
+            )
+        text = processor.batch_decode(out_ids, skip_special_tokens=True)[0].strip()
         return {"text": text}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Server error: {type(e).__name__}: {e}")
 
 if __name__ == "__main__":
     import uvicorn
+    # Use the module name of this file (without .py) if you rename it
     uvicorn.run("server_smolvlm2:app", host="0.0.0.0", port=8000)
