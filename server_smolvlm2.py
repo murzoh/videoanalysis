@@ -2,72 +2,127 @@
 # -*- coding: utf-8 -*-
 
 """
-SmolVLM2 Remote Server (drop-in with runtime CUDA failover)
-- Auto-heals Torch/TorchVision pair.
-- Prints GPU + SM capability.
-- Picks safe dtype (FP32 on older GPUs).
-- **Runtime failover**: if a CUDA "no kernel image" error occurs during inference,
-  switch to CPU FP32 and retry once (per request) to avoid 500s.
-- Env overrides:
-    SMOL_FORCE_CPU=1        → force CPU
-    SMOL_FORCE_FP32=1       → force float32 even on CUDA
-    SMOL_TORCH_INDEX        → override wheel index (default cu121)
-    SMOL_PIP_FLAGS          → extra pip flags
+SmolVLM2 Remote Server (self-healing, no-Conda)
+- Detects GPU + tests a tiny CUDA op.
+- If CUDA kernels don't run (e.g., new SM 12.x GPU on old wheels), auto-installs
+  newer PyTorch *nightly* CUDA wheels (tries cu130 → cu128 → cu126) via pip,
+  then restarts itself.
+- Falls back to CPU wheels if CUDA wheels still don't work.
+- Disables fragile fused attention paths by default.
+- Includes runtime failover to CPU to avoid 500s mid-request.
 """
 
-# --- Pin/fix Torch + TorchVision pair ------------------------------------------------
-import os, sys, subprocess, re
-
-os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
-
-REQUIRED_TORCH_BASE = "2.5.1"
-REQUIRED_VISION_BASE = "0.20.1"
-WHEEL_INDEX = os.environ.get("SMOL_TORCH_INDEX", "https://download.pytorch.org/whl/cu121")
-PIP_FLAGS = os.environ.get("SMOL_PIP_FLAGS", "--break-system-packages --timeout 300 --retries 5")
-
-def _base_ver(v: str) -> str:
-    v = v.split("+", 1)[0]
-    v = re.split(r"[- ]", v, 1)[0]
-    return v
-
-def _ensure_known_good_pair():
-    try:
-        import torch  # noqa
-        torch_base = _base_ver(getattr(torch, "__version__", ""))
-        try:
-            import torchvision  # noqa
-            vision_base = _base_ver(getattr(__import__("torchvision"), "__version__", ""))
-        except Exception as e:
-            vision_base = None
-            raise RuntimeError(f"torchvision issue: {e}")
-        if torch_base == REQUIRED_TORCH_BASE and vision_base == REQUIRED_VISION_BASE:
-            return
-        raise RuntimeError(f"bad pair torch={torch_base!r} torchvision={vision_base!r}")
-    except Exception as e:
-        if os.environ.get("SMOL_AUTOFIX_DONE") == "1":
-            print(f"[startup] Torch pair still wrong after autofix: {e}", file=sys.stderr)
-            sys.exit(1)
-        print(f"[startup] Fixing Torch pair due to: {e}", file=sys.stderr)
-        subprocess.call([sys.executable, "-m", "pip", "uninstall", "-y", "torch", "torchvision", "torchaudio"])
-        cmd = [sys.executable, "-m", "pip", "install", *PIP_FLAGS.split(),
-               "--index-url", WHEEL_INDEX,
-               f"torch=={REQUIRED_TORCH_BASE}", f"torchvision=={REQUIRED_VISION_BASE}"]
-        subprocess.check_call(cmd)
-        os.environ["SMOL_AUTOFIX_DONE"] = "1"
-        os.execv(sys.executable, [sys.executable] + sys.argv)
-
-_ensure_known_good_pair()
-
-# --- Imports that depend on torch ----------------------------------------------------
-import io, base64
+import os, sys, subprocess, re, io, base64
 from typing import List, Optional, Literal
+
+# Make Transformers avoid torchvision internals
+os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
+# Disable fused kernels that may not have SM12.x builds yet
+os.environ.setdefault("XFORMERS_DISABLED", "1")
+os.environ.setdefault("FLASH_ATTENTION_DISABLE", "1")
+
+# --- Bootstrap: ensure a working PyTorch for this GPU (no conda) ----------------------
+
+def _run(cmd, check=False, capture=True):
+    return subprocess.run(cmd, check=check, text=True,
+                          stdout=subprocess.PIPE if capture else None,
+                          stderr=subprocess.STDOUT if capture else None)
+
+def _nvidia_smi_summary():
+    try:
+        out = _run(["nvidia-smi"]).stdout
+        m_drv = re.search(r"Driver Version:\s*([\d.]+)", out or "")
+        m_cuda = re.search(r"CUDA Version:\s*([\d.]+)", out or "")
+        return (m_drv.group(1) if m_drv else "?",
+                m_cuda.group(1) if m_cuda else "?",
+                out.strip() if out else "")
+    except Exception:
+        return ("?", "?", "")
+
+def _tiny_cuda_ok_with_current_torch():
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return True, "cuda_unavailable"  # Nothing to fix; we'll run CPU.
+        # Print useful info
+        dev = torch.cuda.get_device_name(0)
+        cap = torch.cuda.get_device_capability(0)
+        # Force safest SDPA path
+        try:
+            torch.backends.cuda.enable_flash_sdp(False)
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+            torch.backends.cuda.enable_math_sdp(True)
+        except Exception:
+            pass
+        # Try a tiny matmul on CUDA
+        a = torch.randn(256, 256, device="cuda")
+        b = a @ a.t()
+        torch.cuda.synchronize()
+        return True, f"ok({dev}, sm{cap[0]}.{cap[1]})"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+def _pip(*pkgs):
+    print(f"[bootstrap] pip {' '.join(pkgs)}", file=sys.stderr)
+    return _run([sys.executable, "-m", "pip", *pkgs], capture=False)
+
+def _ensure_working_torch():
+    # Allow opting out
+    if os.environ.get("SMOL_SKIP_AUTOFIX") == "1":
+        return
+    ok, why = _tiny_cuda_ok_with_current_torch()
+    if ok:
+        print(f"[bootstrap] CUDA test passed: {why}")
+        return
+    print(f"[bootstrap] CUDA test failed: {why}", file=sys.stderr)
+    drv, cudaver, _ = _nvidia_smi_summary()
+    print(f"[bootstrap] nvidia-smi driver={drv}, CUDA={cudaver}", file=sys.stderr)
+
+    # Uninstall any broken wheels
+    _pip("uninstall", "-y", "torch", "torchvision", "torchaudio", "xformers", "flash-attn")
+
+    # Try nightlies in descending preference for new GPUs
+    nightly_indexes = [
+        "https://download.pytorch.org/whl/nightly/cu130",
+        "https://download.pytorch.org/whl/nightly/cu128",
+        "https://download.pytorch.org/whl/nightly/cu126",
+    ]
+    for idx in nightly_indexes:
+        try:
+            _pip("install", "--pre", "--upgrade", "--index-url", idx, "torch", "torchvision")
+            ok2, why2 = _tiny_cuda_ok_with_current_torch()
+            if ok2:
+                print(f"[bootstrap] Success with nightly @ {idx}: {why2}")
+                # Mark so we don't loop
+                os.environ["SMOL_SKIP_AUTOFIX"] = "1"
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+            else:
+                print(f"[bootstrap] Still failing after install from {idx}: {why2}", file=sys.stderr)
+        except Exception as e:
+            print(f"[bootstrap] Install from {idx} failed: {e}", file=sys.stderr)
+
+    # Last resort: CPU wheels so the API still runs
+    try:
+        _pip("install", "--upgrade", "--index-url", "https://download.pytorch.org/whl/cpu",
+             "torch", "torchvision")
+        print("[bootstrap] Installed CPU-only torch/vision. Service will run on CPU.")
+        os.environ["SMOL_FORCE_CPU"] = "1"
+        os.environ["SMOL_SKIP_AUTOFIX"] = "1"
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as e:
+        print(f"[bootstrap] CPU install failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+_ensure_working_torch()
+
+# ---- Safe to import torch-dependent libs now -----------------------------------------
 import torch
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from PIL import Image
 from transformers import AutoProcessor, AutoModelForImageTextToText
 
-# --- Model / Device selection --------------------------------------------------------
+# ---------------- Model / device selection -------------------------------------------
 MODEL_ID = os.environ.get("SMOLVLM2_MODEL", "HuggingFaceTB/SmolVLM2-500M-Video-Instruct")
 API_KEY  = os.environ.get("SMOLVLM_API_KEY")
 
@@ -75,8 +130,7 @@ def pick_device_and_dtype():
     if os.environ.get("SMOL_FORCE_CPU") == "1":
         print("[startup] SMOL_FORCE_CPU=1 → using CPU.")
         return "cpu", torch.float32
-    cuda_ok = torch.cuda.is_available()
-    if not cuda_ok:
+    if not torch.cuda.is_available():
         print("[startup] CUDA not available → using CPU.")
         return "cpu", torch.float32
     name = torch.cuda.get_device_name(0)
@@ -85,56 +139,55 @@ def pick_device_and_dtype():
     if os.environ.get("SMOL_FORCE_FP32") == "1":
         print("[startup] SMOL_FORCE_FP32=1 → using float32 on CUDA.")
         return "cuda", torch.float32
-    # Prefer FP32 on very old GPUs
+    # Prefer FP32 on unknown/very new arches to avoid half-only kernels
+    if cap_major >= 12:
+        print("[startup] New SM detected → preferring float32 on CUDA for safety.")
+        return "cuda", torch.float32
     if cap_major < 6:
         print("[startup] Older SM detected → using float32 on CUDA.")
         return "cuda", torch.float32
     return "cuda", torch.float16
 
-DEVICE: str
-DTYPE: torch.dtype
-model = None
-processor = None
+DEVICE, DTYPE = pick_device_and_dtype()
+print(f"Loading {MODEL_ID} on {DEVICE} with dtype={DTYPE}…")
 
-def build_processor():
-    return AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+# Keep SDPA safe
+try:
+    if torch.cuda.is_available():
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+except Exception:
+    pass
 
-def build_model(device: str, dtype: torch.dtype):
+processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+
+def load_model(device: str, dtype: torch.dtype):
     m = AutoModelForImageTextToText.from_pretrained(
         MODEL_ID, torch_dtype=dtype, low_cpu_mem_usage=True, trust_remote_code=True
     )
     return m.to(device).eval()
 
-def init_stack(force: Optional[str] = None):
-    """
-    force: None | "cuda_fp32" | "cpu_fp32"
-    """
-    global DEVICE, DTYPE, model, processor
-    if processor is None:
-        processor = build_processor()
-    if force == "cuda_fp32":
-        DEVICE, DTYPE = "cuda", torch.float32
-    elif force == "cpu_fp32":
-        DEVICE, DTYPE = "cpu", torch.float32
+try:
+    model = load_model(DEVICE, DTYPE)
+except RuntimeError as e:
+    msg = str(e).lower()
+    if "no kernel image" in msg or "illegal instruction" in msg:
+        if DEVICE == "cuda" and DTYPE != torch.float32:
+            print("[startup] Retry on CUDA FP32 due to kernel-image error…")
+            DEVICE, DTYPE = "cuda", torch.float32
+            model = load_model(DEVICE, DTYPE)
+        else:
+            print("[startup] Falling back to CPU FP32 due to kernel-image error…")
+            DEVICE, DTYPE = "cpu", torch.float32
+            model = load_model(DEVICE, DTYPE)
     else:
-        DEVICE, DTYPE = pick_device_and_dtype()
-    print(f"Loading {MODEL_ID} on {DEVICE} with dtype={DTYPE}…")
-    model = build_model(DEVICE, DTYPE)
-    print("Model ready.")
+        raise
 
-def is_kernel_image_error(err: BaseException) -> bool:
-    s = str(err).lower()
-    return ("no kernel image is available" in s
-            or "an illegal instruction was encountered" in s
-            or "device-side assert" in s)
-
-# First initialisation
-init_stack()
-
-# Thread cap to keep small VMs snappy
 torch.set_num_threads(max(1, min(8, os.cpu_count() or 4)))
+print("Model ready.")
 
-# --- Prompt / schema -----------------------------------------------------------------
+# ---------------- Inference prompt scaffolding ----------------------------------------
 EVENT_ENUM = ["goal","shot_on_target","shot_off_target","save","foul","offside","corner","none"]
 
 SERVER_SYSTEM_PROMPT = f"""
@@ -162,7 +215,8 @@ STRICT RULES
 - 'goal' only if the ball clearly crosses the line; 'save' when keeper stops a goal-bound shot.
 """.strip()
 
-# --- FastAPI app --------------------------------------------------------------------
+# ---------------- FastAPI app ---------------------------------------------------------
+from fastapi import FastAPI
 app = FastAPI(title="SmolVLM2 Remote Server")
 
 class AnalyzeRequest(BaseModel):
@@ -234,12 +288,14 @@ def analyze(req: AnalyzeRequest, x_api_key: Optional[str] = Header(default=None)
         text=processor.batch_decode(out_ids, skip_special_tokens=True)[0].strip()
         return {"text": text}
     except RuntimeError as e:
-        # Runtime CUDA failover path: only retry once, switching to CPU FP32.
-        if is_kernel_image_error(e) and DEVICE == "cuda":
-            print("[runtime] CUDA kernel-image error during inference → switching to CPU FP32 and retrying once…", file=sys.stderr)
-            init_stack(force="cpu_fp32")
+        msg = str(e).lower()
+        if ("no kernel image" in msg or "illegal instruction" in msg) and DEVICE == "cuda":
+            # Runtime failover
+            print("[runtime] CUDA kernel-image error → switching to CPU FP32 and retrying once…", file=sys.stderr)
+            global DEVICE, DTYPE, model
+            DEVICE, DTYPE = "cpu", torch.float32
+            model = load_model(DEVICE, DTYPE)
             try:
-                # Rebuild inputs on CPU
                 pil_images=[Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB") for b64 in req.images_b64]
                 user_text=build_user_text(req)
                 inputs=_prepare_inputs(pil_images, user_text)
