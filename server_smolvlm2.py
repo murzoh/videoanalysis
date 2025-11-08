@@ -277,7 +277,6 @@ def _run_generate(inputs, max_new_tokens: int):
         )
 
 @app.post("/analyze")
-@app.post("/analyze")
 def analyze(req: AnalyzeRequest, x_api_key: Optional[str] = Header(default=None)):
     global DEVICE, DTYPE, model  # <-- moved here (top of function)
 
