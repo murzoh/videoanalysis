@@ -165,7 +165,7 @@ tinycss2==1.4.0
 tokenizers==0.22.1
 #torch==2.6.0+cu124
 TorchCodec==0.2.1
-torchvision==0.21.0+cu124
+#torchvision==0.21.0+cu124
 tornado==6.5.2
 tqdm==4.67.1
 traitlets==5.14.3
